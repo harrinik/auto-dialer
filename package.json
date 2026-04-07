@@ -1,0 +1,20 @@
+{
+  "name": "autodialer-2026",
+  "version": "1.0.0",
+  "description": "Distributed Asterisk Dialer",
+  "scripts": {
+    "start": "pm2 start ecosystem.config.js",
+    "stop": "pm2 stop all",
+    "logs": "pm2 logs"
+  },
+  "dependencies": {
+    "ari-client": "^2.2.0",
+    "bullmq": "^5.0.0",
+    "dotenv": "^16.0.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "ioredis": "^5.3.2",
+    "pino": "^9.0.0",
+    "pino-pretty": "^11.0.0",
+    "telegraf": "^4.16.3"
+  }
+}
