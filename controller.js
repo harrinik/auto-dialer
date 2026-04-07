@@ -13,6 +13,8 @@ const managerBot = new Telegraf(process.env.MANAGER_BOT_TOKEN);
 const adminBot   = new Telegraf(process.env.ADMIN_BOT_TOKEN);
 const notifBot   = new Telegraf(process.env.NOTIF_BOT_TOKEN);
 
+const IVR_DIR = process.env.IVR_AUDIO_PATH ? path.dirname(process.env.IVR_AUDIO_PATH) : __dirname;
+
 // ─── Shared Helpers ────────────────────────────────────────────────────────────
 async function getStats() {
     const counts    = await dialQueue.getJobCounts('waiting', 'active', 'completed', 'failed');
@@ -60,7 +62,7 @@ const mgrMenu = () => Markup.inlineKeyboard([
     [Markup.button.callback('⏸ Pause',          'mgr:pause'),   Markup.button.callback('▶️ Resume',  'mgr:resume')],
     [Markup.button.callback('🛑 Stop & Clear',  'mgr:stop')],
     [Markup.button.callback('🚫 DNC List',      'mgr:dnc'),     Markup.button.callback('🏆 Leads',   'mgr:leads')],
-    [Markup.button.callback('🎙 IVR Status',    'mgr:ivr'),     Markup.button.callback('🗑 History', 'mgr:clrhist')],
+    [Markup.button.callback('🎙 IVR Library',    'mgr:ivrs'),     Markup.button.callback('🗑 History', 'mgr:clrhist')],
     [Markup.button.callback('❓ Help',           'mgr:help')],
 ]);
 
@@ -152,10 +154,11 @@ managerBot.command('report', async ctx => {
 });
 
 managerBot.command('leads',  async ctx => ctx.reply(`🏆 Leads: ${await redis.get('stat:leads') || 0}`));
-managerBot.command('ivrstatus', ctx => ctx.reply(
-    fs.existsSync('/var/lib/asterisk/sounds/custom/current_ivr.wav')
-        ? '✅ IVR file loaded and ready.' : '❌ No IVR file. Upload a .wav or voice note.'
-));
+managerBot.command('ivrstatus', async ctx => {
+    const active = await redis.get('config:active_ivr');
+    const target = active ? path.join(IVR_DIR, active) : path.join(IVR_DIR, 'current_ivr.wav');
+    ctx.reply(fs.existsSync(target) ? `✅ Active IVR: ${active || 'current_ivr.wav'}` : '❌ No active IVR found.');
+});
 
 managerBot.command('blacklist', async ctx => {
     const num = ctx.message.text.split(' ')[1];
@@ -237,13 +240,58 @@ managerBot.action('mgr:dnc', async ctx => {
     ctx.answerCbQuery();
 });
 
-managerBot.action('mgr:ivr', ctx => {
-    ctx.editMessageText(
-        fs.existsSync('/var/lib/asterisk/sounds/custom/current_ivr.wav')
-            ? '✅ IVR ready.' : '❌ No IVR file. Upload a .wav or voice note.',
-        Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'mgr:menu')]])
-    );
+managerBot.action('mgr:ivrs', async ctx => {
+    if (!fs.existsSync(IVR_DIR)) fs.mkdirSync(IVR_DIR, { recursive: true });
+    const files = fs.readdirSync(IVR_DIR).filter(f => f.endsWith('.wav'));
+    const active = await redis.get('config:active_ivr') || 'current_ivr.wav';
+    
+    if (files.length === 0) {
+        ctx.editMessageText('❌ No IVR files exist in the library. Upload a .wav or voice note!', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'mgr:menu')]])).catch(ignoreSameHelper);
+        return ctx.answerCbQuery();
+    }
+    
+    const buttons = files.map(f => [
+        Markup.button.callback(`${f === active ? '✅' : '⚪'} ${f}`, `setivr:${f}`),
+        Markup.button.callback('🗑 Delete', `delivr:${f}`)
+    ]);
+    buttons.push([Markup.button.callback('⬅️ Back', 'mgr:menu')]);
+    
+    ctx.editMessageText(`📂 <b>IVR Library</b>\nSelect an active campaign track:`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(ignoreSameHelper);
     ctx.answerCbQuery();
+});
+
+managerBot.action(/^setivr:(.+)$/, async ctx => {
+    const f = ctx.match[1];
+    await redis.set('config:active_ivr', f);
+    ctx.answerCbQuery(`✅ Active IVR set to ${f}`);
+    // Re-trigger the library view to update the ✅ mark
+    const files = fs.readdirSync(IVR_DIR).filter(file => file.endsWith('.wav'));
+    const buttons = files.map(file => [
+        Markup.button.callback(`${file === f ? '✅' : '⚪'} ${file}`, `setivr:${file}`),
+        Markup.button.callback('🗑 Delete', `delivr:${file}`)
+    ]);
+    buttons.push([Markup.button.callback('⬅️ Back', 'mgr:menu')]);
+    ctx.editMessageText(`📂 <b>IVR Library</b>\nSelect an active campaign track:`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(ignoreSameHelper);
+});
+
+managerBot.action(/^delivr:(.+)$/, async ctx => {
+    const f = ctx.match[1];
+    const target = path.join(IVR_DIR, f);
+    if (fs.existsSync(target)) fs.unlinkSync(target);
+    ctx.answerCbQuery(`🗑 Deleted ${f}`);
+    
+    const files = fs.readdirSync(IVR_DIR).filter(file => file.endsWith('.wav'));
+    if (files.length === 0) {
+        ctx.editMessageText('❌ No IVR files exist in the library.', Markup.inlineKeyboard([[Markup.button.callback('⬅️ Back', 'mgr:menu')]])).catch(ignoreSameHelper);
+        return;
+    }
+    const active = await redis.get('config:active_ivr') || 'current_ivr.wav';
+    const buttons = files.map(file => [
+        Markup.button.callback(`${file === active ? '✅' : '⚪'} ${file}`, `setivr:${file}`),
+        Markup.button.callback('🗑 Delete', `delivr:${file}`)
+    ]);
+    buttons.push([Markup.button.callback('⬅️ Back', 'mgr:menu')]);
+    ctx.editMessageText(`📂 <b>IVR Library</b>\nSelect an active campaign track:`, { parse_mode: 'HTML', ...Markup.inlineKeyboard(buttons) }).catch(ignoreSameHelper);
 });
 
 managerBot.action('mgr:clrhist', ctx => {
@@ -312,19 +360,21 @@ managerBot.on(['document', 'voice'], async ctx => {
         pino.info(`Bot: Received IVR audio file from user. Converting...`);
         const msg  = await ctx.reply('⏳ Converting IVR audio...');
         const link = await ctx.telegram.getFileLink(file.file_id);
-        const ivrPath = process.env.IVR_AUDIO_PATH || path.join(__dirname, 'current_ivr.wav');
         
+        let filename = file.file_name ? file.file_name.toLowerCase().replace(/[^a-z0-9]/g, '_').replace(/_wav$/, '.wav') : `voicenote_${Date.now()}.wav`;
+        if (!filename.endsWith('.wav')) filename += '.wav';
+        
+        const targetPath = path.join(IVR_DIR, filename);
+
         // Ensure the directory exists
-        const ivrDir = path.dirname(ivrPath);
-        if (!fs.existsSync(ivrDir)) {
-            fs.mkdirSync(ivrDir, { recursive: true });
-        }
+        if (!fs.existsSync(IVR_DIR)) fs.mkdirSync(IVR_DIR, { recursive: true });
 
         ffmpeg(link.href).toFormat('wav').audioChannels(1).audioFrequency(8000)
-            .save(ivrPath)
-            .on('end',   () => {
-                pino.info(`Audio converted and saved to ${ivrPath}`);
-                ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `✅ <b>IVR Updated!</b>\n\n8kHz mono WAV uploaded and stored successfully at:\n<code>${ivrPath}</code>`, { parse_mode: 'HTML' }).catch(ignoreSameHelper);
+            .save(targetPath)
+            .on('end',   async () => {
+                pino.info(`Audio converted and saved to ${targetPath}`);
+                await redis.set('config:active_ivr', filename);
+                ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `✅ <b>IVR Added & Set Active!</b>\n\n<code>${filename}</code> has been uploaded successfully.`, { parse_mode: 'HTML' }).catch(ignoreSameHelper);
             })
             .on('error', e => {
                 pino.error(`Audio conversion failed: ${e.message}`);

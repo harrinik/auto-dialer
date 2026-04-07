@@ -136,8 +136,13 @@ async function init() {
             pino.info(`✅ Answered (by Dialplan): ${channel.name}`);
         }
 
+        // Load active IVR dynamically
+        const activeNameExt = await redis.get('config:active_ivr') || 'current_ivr.wav';
+        const activeName = activeNameExt.replace(/\.wav$/, '');
+        const mediaTag = `sound:custom/${activeName}`;
+
         // 3) Play IVR
-        const playback = await channel.play({ media: 'sound:custom/current_ivr' }).catch(e => {
+        const playback = await channel.play({ media: mediaTag }).catch(e => {
             pino.error(`Playback error: ${e.message}`);
         });
 
@@ -176,8 +181,8 @@ async function init() {
 
             } else if (digit === '9') {
                 // ── Replay IVR message ──
-                pino.info(`🔁 Replay IVR: ${channel.name}`);
-                channel.play({ media: 'sound:custom/current_ivr' }).catch(e => pino.error(`Replay error: ${e.message}`));
+                pino.info(`🔄 Replay IVR: ${channel.name}`);
+                channel.play({ media: mediaTag }).catch(e => pino.error(`Replay error: ${e.message}`));
                 // Re-arm hangup timer after replay
                 const replayTimer = setTimeout(() => channel.hangup().catch(() => {}), timeoutSec * 1000);
                 channel.once('ChannelDtmfReceived', async (e2) => {
