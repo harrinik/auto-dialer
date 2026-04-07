@@ -2,11 +2,12 @@ require('dotenv').config();
 const { Worker } = require('bullmq');
 const ari        = require('ari-client');
 const fs         = require('fs');
+const path       = require('path');
 const redis      = require('./lib/redis');
 const { createClient } = require('./lib/redis-sub');
 const pino       = require('pino')({ transport: { target: 'pino-pretty' } });
 
-const IVR_FILE   = '/var/lib/asterisk/sounds/custom/current_ivr.wav';
+const IVR_FILE   = process.env.IVR_AUDIO_PATH || path.join(__dirname, 'current_ivr.wav');
 const publisher  = createClient(); // dedicated pub client
 
 // ─── Helpers ───────────────────────────────────────────────────────────────────

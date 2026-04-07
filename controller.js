@@ -4,6 +4,7 @@ const { Queue } = require('bullmq');
 const redis = require('./lib/redis');
 const ffmpeg = require('fluent-ffmpeg');
 const fs = require('fs');
+const path = require('path');
 const pino = require('pino')({ transport: { target: 'pino-pretty' } });
 
 
@@ -311,16 +312,23 @@ managerBot.on(['document', 'voice'], async ctx => {
         pino.info(`Bot: Received IVR audio file from user. Converting...`);
         const msg  = await ctx.reply('⏳ Converting IVR audio...');
         const link = await ctx.telegram.getFileLink(file.file_id);
-        const ivrPath = '/var/lib/asterisk/sounds/custom/current_ivr.wav';
+        const ivrPath = process.env.IVR_AUDIO_PATH || path.join(__dirname, 'current_ivr.wav');
+        
+        // Ensure the directory exists
+        const ivrDir = path.dirname(ivrPath);
+        if (!fs.existsSync(ivrDir)) {
+            fs.mkdirSync(ivrDir, { recursive: true });
+        }
+
         ffmpeg(link.href).toFormat('wav').audioChannels(1).audioFrequency(8000)
             .save(ivrPath)
             .on('end',   () => {
                 pino.info(`Audio converted and saved to ${ivrPath}`);
-                ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `✅ <b>IVR Updated!</b>\n\n8kHz mono WAV uploaded and stored successfully at:\n<code>${ivrPath}</code>`, { parse_mode: 'HTML' });
+                ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `✅ <b>IVR Updated!</b>\n\n8kHz mono WAV uploaded and stored successfully at:\n<code>${ivrPath}</code>`, { parse_mode: 'HTML' }).catch(ignoreSameHelper);
             })
             .on('error', e => {
                 pino.error(`Audio conversion failed: ${e.message}`);
-                ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `❌ Conversion failed: ${e.message}`);
+                ctx.telegram.editMessageText(ctx.chat.id, msg.message_id, null, `❌ Conversion failed: ${e.message}`).catch(ignoreSameHelper);
             });
         return;
     }
