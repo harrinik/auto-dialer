@@ -516,6 +516,15 @@ sub.subscribe('errors', (msg) => {
     } catch (e) {}
 });
 
+// ─── Native Exception Catchers ───────────────────────────────────────────────────
+const ignoreSameHelper = (err, ctx) => {
+    if (err.description && err.description.includes('exactly the same')) return;
+    pino.error(`Telegram Error [${ctx.updateType}]: ${err.message}`);
+};
+managerBot.catch(ignoreSameHelper);
+adminBot.catch(ignoreSameHelper);
+notifBot.catch(ignoreSameHelper);
+
 // ─── Launch ────────────────────────────────────────────────────────────────────
 managerBot.launch().then(() => pino.info('🚀 Manager Bot is running.'));
 adminBot.launch().then(() => pino.info('🚀 Admin Bot is running.'));
