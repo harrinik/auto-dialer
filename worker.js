@@ -9,30 +9,25 @@ const pino = require('pino')({ transport: { target: 'pino-pretty' } });
 const IVR_FILE = process.env.IVR_AUDIO_PATH || path.join(__dirname, 'current_ivr.wav');
 
 // ─────────────────────────────────────────────
-// NORMALIZE TO E.164 (GLOBAL FORMAT FIX)
+// NORMALIZE TO E.164 (GLOBAL SUPPORT FIXED)
 // ─────────────────────────────────────────────
 function normalizeToE164(number) {
     if (!number) return null;
 
     let num = number.toString().trim();
 
-    // remove spaces, dashes, brackets
+    // remove spaces, dashes, parentheses
     num = num.replace(/[^\d+]/g, '');
 
-    // already E.164
     if (num.startsWith('+')) return num;
 
-    // Kenya fallback (optional)
+    // Kenya fallback
     if (num.startsWith('0')) {
-        num = '+254' + num.substring(1);
+        return '+254' + num.slice(1);
     }
 
-    // assume international without +
-    if (!num.startsWith('+')) {
-        num = '+' + num;
-    }
-
-    return num;
+    // generic international fallback
+    return '+' + num;
 }
 
 // ─────────────────────────────────────────────
@@ -41,11 +36,14 @@ async function getCPS() {
 }
 
 async function getConc() {
-    return parseInt((await redis.get('config:concurrency')) || process.env.CONCURRENCY || 25);
+    return parseInt((await redis.get('config:concurrency')) || process.env.CONCURRENCY || 10);
 }
 
-// CPS throttle
+// ─────────────────────────────────────────────
+// CPS THROTTLE (GLOBAL SAFE)
+// ─────────────────────────────────────────────
 let nextTime = Date.now();
+
 async function throttle() {
     const cps = await getCPS();
     const interval = 1000 / cps;
@@ -56,16 +54,23 @@ async function throttle() {
     const wait = nextTime - now;
     nextTime += interval;
 
-    if (wait > 0) await new Promise(r => setTimeout(r, wait));
+    if (wait > 0) {
+        await new Promise(r => setTimeout(r, wait));
+    }
 }
 
+// ─────────────────────────────────────────────
 function publish(channel, payload) {
-    // optional redis pub/sub if needed
     redis.publish(channel, JSON.stringify(payload)).catch(() => { });
 }
 
 // ─────────────────────────────────────────────
-// MAIN
+// ACTIVE CALL TRACKING (CRITICAL FIX)
+// ─────────────────────────────────────────────
+const activeCalls = new Map();
+
+// ─────────────────────────────────────────────
+// MAIN WORKER
 // ─────────────────────────────────────────────
 async function init() {
     pino.info('🔌 Connecting ARI...');
@@ -83,9 +88,12 @@ async function init() {
     const worker = new Worker(
         'dialer-queue',
         async (job) => {
-            let phoneNumber = normalizeToE164(job.data.phoneNumber);
+            const raw = job.data.phoneNumber;
+            const phoneNumber = normalizeToE164(raw);
 
-            if (!phoneNumber) throw new Error('INVALID_NUMBER');
+            if (!phoneNumber) {
+                throw new Error(`INVALID_NUMBER: ${raw}`);
+            }
 
             if (!fs.existsSync(IVR_FILE)) {
                 throw new Error('IVR_FILE_MISSING');
@@ -93,41 +101,54 @@ async function init() {
 
             await throttle();
 
-            pino.info(`📞 Dialing: ${phoneNumber}`);
+            pino.info(`📞 Dialing → ${phoneNumber}`);
 
-            try {
-                const channel = await client.channels.originate({
-                    endpoint: `${process.env.TRUNK_NAME}/${phoneNumber}`,
-                    app: 'dialer-app',
-                    callerId: process.env.CALLER_ID || 'AutoDialer',
-                    variables: {
-                        DIALLED_NUMBER: phoneNumber
-                    }
-                });
+            return new Promise(async (resolve, reject) => {
+                let channelRef = null;
+                let finished = false;
 
-                // WAIT UNTIL CALL ENDS
-                await new Promise((resolve) => {
-                    let done = false;
+                const cleanup = (reason) => {
+                    if (finished) return;
+                    finished = true;
 
-                    const finish = () => {
-                        if (done) return;
-                        done = true;
-                        resolve();
-                    };
+                    activeCalls.delete(phoneNumber);
 
-                    channel.once('StasisEnd', finish);
-                    channel.once('ChannelDestroyed', finish);
+                    if (reason === 'error') reject(new Error('CALL_FAILED'));
+                    else resolve();
+                };
 
-                    setTimeout(finish, 60 * 60 * 1000);
-                });
+                try {
+                    channelRef = await client.channels.originate({
+                        endpoint: `${process.env.TRUNK_NAME}/${phoneNumber}`,
+                        app: 'dialer-app',
+                        callerId: process.env.CALLER_ID || 'AutoDialer',
+                        variables: {
+                            DIALLED_NUMBER: phoneNumber
+                        }
+                    });
 
-                pino.info(`✅ Call finished: ${phoneNumber}`);
-            } catch (err) {
-                pino.error(`❌ Call failed ${phoneNumber}: ${err.message}`);
-                await redis.incr('stat:failed');
-                publish('errors', { phoneNumber, message: err.message });
-                throw err;
-            }
+                    activeCalls.set(phoneNumber, channelRef);
+
+                    // SAFE EVENT HANDLING
+                    channelRef.once('StasisEnd', () => cleanup('end'));
+                    channelRef.once('ChannelDestroyed', () => cleanup('end'));
+
+                    // HARD TIMEOUT SAFETY
+                    setTimeout(() => {
+                        if (!finished) {
+                            pino.warn(`⏱ Timeout call cleanup: ${phoneNumber}`);
+                            try { channelRef.hangup(); } catch { }
+                            cleanup('timeout');
+                        }
+                    }, 2 * 60 * 1000); // 2 min max call window
+
+                } catch (err) {
+                    pino.error(`❌ Originate failed ${phoneNumber}: ${err.message}`);
+                    await redis.incr('stat:failed');
+                    publish('errors', { phoneNumber, message: err.message });
+                    reject(err);
+                }
+            });
         },
         {
             connection: redis,
@@ -135,15 +156,15 @@ async function init() {
         }
     );
 
-    worker.on('failed', (job, err) => {
-        pino.error(`❌ Job failed: ${job?.id} → ${err.message}`);
-    });
-
     worker.on('completed', (job) => {
-        pino.info(`✅ Job completed: ${job.id}`);
+        pino.info(`✅ Completed: ${job.id}`);
     });
 
-    pino.info(`🚀 Worker running | CPS=${await getCPS()} | CONC=${await getConc()}`);
+    worker.on('failed', (job, err) => {
+        pino.error(`❌ Failed: ${job?.id} → ${err.message}`);
+    });
+
+    pino.info(`🚀 Worker READY | CPS=${await getCPS()} | CONC=${await getConc()}`);
 }
 
 init().catch((err) => {
